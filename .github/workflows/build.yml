@@ -1,5 +1,21 @@
 name: build
-on: [push, pull_request]
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: '是否运行测试 (true/false)'
+        required: true
+        default: 'false'
+        type: boolean
+      platforms:
+        description: '要编译的平台，用逗号分隔 (可选: windows, macos, ubuntu)'
+        required: true
+        default: 'windows, macos, ubuntu'
+        type: string
+
 jobs:
   build:
     runs-on: ${{ matrix.os }}
@@ -12,18 +28,37 @@ jobs:
         ui: [gui, cli]
         scripting: [lua, noscripts]
         exclude:
-          - build_type: Debug
+          - ui: cli                  # 跳过所有 cli 版本的编译
+          - scripting: noscripts     # 跳过所有 noscripts 版本的编译
+          - build_type: Debug        # 移除 Debug + gui + lua 的组合（仅保留 Release 版）
             ui: gui
-          - build_type: RelWithDebInfo
-            ui: cli
-          - build_type: RelWithDebInfo
-            scripting: noscripts
+
     steps:
+    # 新增一个内部环境变量，用来判断当前矩阵行是否命中用户选择的平台
+    # 这样可以避免在每个 Step 里写又长又臭的判断
+    - name: Check if current platform is enabled
+      shell: bash
+      id: check_env
+      run: |
+        # 将矩阵系统转为小写关键词
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then KEY="windows"; fi
+        if [[ "${{ matrix.os }}" == "macos-latest" ]]; then KEY="macos"; fi
+        if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then KEY="ubuntu"; fi
+        
+        # 判断是否包含该平台
+        if [[ "${{ github.event_name }}" != "workflow_dispatch" ]] || [[ "${{ inputs.platforms }}" == *"$KEY"* ]]; then
+          echo "SHOULD_RUN=true" >> $GITHUB_ENV
+        else
+          echo "SHOULD_RUN=false" >> $GITHUB_ENV
+        fi
+
     - uses: actions/checkout@v4
+      if: env.SHOULD_RUN == 'true'
       with:
         submodules: 'recursive'
+
     - name: Install Dependencies
-      if: runner.os == 'Linux'
+      if: env.SHOULD_RUN == 'true' && runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update -qq
@@ -31,8 +66,9 @@ jobs:
           libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
           libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
           libfontconfig1-dev
+
     - name: Install Skia
-      if: ${{ matrix.ui == 'gui' }}
+      if: env.SHOULD_RUN == 'true' && matrix.ui == 'gui'
       shell: bash
       run: |
         if [[ "${{ runner.os }}" == "Windows" ]] ; then
@@ -44,15 +80,21 @@ jobs:
         skia_file=$(basename $skia_url)
         curl --ssl-revoke-best-effort -L -o "$skia_file" "$skia_url"
         unzip "$skia_file" -d skia
+
     - name: ccache
       uses: hendrikmuhs/ccache-action@v1.2.17
-      if: ${{ runner.os == 'Linux' || runner.os == 'macOS' }}
+      if: env.SHOULD_RUN == 'true' && (runner.os == 'Linux' || runner.os == 'macOS')
       with:
         key: ${{ matrix.os }}-${{ matrix.ui }}-${{ matrix.scripting }}-${{ matrix.build_type }}
+
     - uses: aseprite/get-ninja@main
+      if: env.SHOULD_RUN == 'true'
+
     - uses: ilammy/msvc-dev-cmd@v1
-      if: runner.os == 'Windows'
+      if: env.SHOULD_RUN == 'true' && runner.os == 'Windows'
+
     - name: Generating Makefiles
+      if: env.SHOULD_RUN == 'true'
       shell: bash
       run: |
         if [[ "${{ runner.os }}" == "Windows" ]] ; then
@@ -88,19 +130,24 @@ jobs:
           -DLAF_BACKEND=$laf_backend \
           -DSKIA_DIR=$(realpath skia) \
           -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch)
+
     - name: Compiling
+      if: env.SHOULD_RUN == 'true'
       shell: bash
       run: |
         cd build && ninja
+
     - name: Running C++ Tests
+      if: env.SHOULD_RUN == 'true' && (github.event_name != 'workflow_dispatch' || inputs.run_tests == true)
       shell: bash
       run: |
         if [[ "${{ runner.os }}" == "Linux" ]] ; then
           export XVFB=xvfb-run
         fi
         cd build && $XVFB ctest --output-on-failure
+
     - name: Running CLI Tests
-      if: ${{ matrix.scripting == 'lua' }}
+      if: env.SHOULD_RUN == 'true' && (github.event_name != 'workflow_dispatch' || inputs.run_tests == true) && matrix.scripting == 'lua'
       shell: bash
       run: |
         if [[ "${{ runner.os }}" == "Linux" ]] ; then
@@ -109,3 +156,24 @@ jobs:
         export ASEPRITE=$PWD/build/bin/aseprite
         cd tests
         $XVFB bash run-tests.sh
+
+    - name: Clean Up Build folder
+      if: env.SHOULD_RUN == 'true'
+      working-directory: build/bin
+      shell: bash
+      run: |
+        find . -mindepth 1 ! \( -name 'aseprite' -o -name 'aseprite.exe' -o -name 'data' -prune -o -name 'Aseprite.app' -prune \) -exec rm -rf {} +
+
+    - name: Make portable zip config
+      if: env.SHOULD_RUN == 'true'
+      working-directory: build/bin
+      shell: bash
+      run: echo '# This file is here so Aseprite behaves as a portable program' > aseprite.ini
+
+    - name: Upload Artifacts
+      if: env.SHOULD_RUN == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: Aseprite-${{ matrix.os }}-${{ matrix.ui }}-${{ matrix.scripting }}-${{ matrix.build_type }}
+        path: build/bin/
+        if-no-files-found: error
